@@ -1,0 +1,133 @@
+# ---------- Reusable anchors ----------
+x-env-kafka: &env-kafka
+  KAFKA_CFG_PROCESS_ROLES: "broker,controller"
+  KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka1:9093,2@kafka2:9093,3@kafka3:9093"
+  KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+  KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,EXTERNAL://:9094,CONTROLLER://:9093"
+  KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+  KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+  KAFKA_CFG_LOG_DIRS: "/var/lib/kafka/data"
+  KAFKA_CFG_NUM_PARTITIONS: "3"
+  KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+  KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+  KAFKA_CFG_DELETE_TOPIC_ENABLE: "true"
+  KAFKA_CFG_CONTROLLED_SHUTDOWN_ENABLE: "true"
+  KAFKA_CLUSTER_ID: "q4W8eM8mQzSv0oPqsW1r1Q"
+  KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+
+x-cmd-kafka: &cmd-kafka
+  - bash
+  - -c
+  - |
+      set -euo pipefail
+      KAFKA_HOME=$${KAFKA_HOME:-/opt/kafka}
+      DATA_DIR=$${KAFKA_DATA:-/var/lib/kafka/data}
+      RUNTIME_CFG=$${KAFKA_CONFIG:-$$KAFKA_HOME/config/server.properties}
+      FORMAT_CFG="/tmp/format-kraft.properties"
+
+      # Create a minimal KRaft config for the *format* step (storage tool only reads files)
+      cat > "$$FORMAT_CFG" <<EOF
+      process.roles=$${KAFKA_CFG_PROCESS_ROLES}
+      node.id=$${KAFKA_CFG_NODE_ID}
+      controller.quorum.voters=$${KAFKA_CFG_CONTROLLER_QUORUM_VOTERS}
+      controller.listener.names=$${KAFKA_CFG_CONTROLLER_LISTENER_NAMES}
+      listeners=$${KAFKA_CFG_LISTENERS}
+      listener.security.protocol.map=$${KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP}
+      inter.broker.listener.name=$${KAFKA_CFG_INTER_BROKER_LISTENER_NAME}
+      log.dirs=$${KAFKA_CFG_LOG_DIRS}
+      EOF
+
+      # Format once per data volume
+      if [ ! -f "$$DATA_DIR/meta.properties" ]; then
+        echo "Formatting storage (cluster-id $${KAFKA_CLUSTER_ID}) using $$FORMAT_CFG ..."
+        "$$KAFKA_HOME/bin/kafka-storage.sh" format \
+          --config "$$FORMAT_CFG" \
+          --cluster-id "$${KAFKA_CLUSTER_ID}" \
+          --ignore-formatted
+      fi
+
+      # Build --override flags from KAFKA_CFG_* envs for the *runtime* broker
+      OVERRIDES=()
+      while IFS="=" read -r name value; do
+        if [[ "$$name" == KAFKA_CFG_* ]]; then
+          key="$(echo "$${name#KAFKA_CFG_}" | tr '[:upper:]' '[:lower:]' | tr '_' '.')"
+          OVERRIDES+=( --override "$${key}=$${value}" )
+        fi
+      done < <(env)
+
+      echo "Starting Kafka with overrides: $${OVERRIDES[*]}"
+      exec "$$KAFKA_HOME/bin/kafka-server-start.sh" "$$RUNTIME_CFG" "$${OVERRIDES[@]}"
+
+x-svc-common: &svc-common
+  image: apache/kafka:4.1.0
+  restart: unless-stopped
+  networks: [knet]
+  command: *cmd-kafka
+
+# ---------- Topology ----------
+services:
+  kafka1:
+    <<: *svc-common
+    container_name: kafka1
+    hostname: kafka1
+    environment:
+      <<: *env-kafka
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka1:9092,EXTERNAL://localhost:19092"
+    ports:
+      - "19092:9094"
+    volumes:
+      - kafka1-data:/var/lib/kafka/data
+
+  kafka2:
+    <<: *svc-common
+    container_name: kafka2
+    hostname: kafka2
+    environment:
+      <<: *env-kafka
+      KAFKA_CFG_NODE_ID: "2"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka2:9092,EXTERNAL://localhost:29092"
+    ports:
+      - "29092:9094"
+    volumes:
+      - kafka2-data:/var/lib/kafka/data
+
+  kafka3:
+    <<: *svc-common
+    container_name: kafka3
+    hostname: kafka3
+    environment:
+      <<: *env-kafka
+      KAFKA_CFG_NODE_ID: "3"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka3:9092,EXTERNAL://localhost:39092"
+    ports:
+      - "39092:9094"
+    volumes:
+      - kafka3-data:/var/lib/kafka/data
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:8.3.2
+    container_name: schema-registry
+    hostname: schema-registry
+    restart: unless-stopped
+    networks: [knet]
+    depends_on: [kafka1, kafka2, kafka3]
+    ports:
+      - "8085:8081"                      # http://localhost:8085 from the host, as in notes 11 and 12
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: "http://0.0.0.0:8081"
+      # Schemas are stored in the _schemas topic on the brokers (no ZooKeeper, KRaft is fine)
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "PLAINTEXT://kafka1:9092,PLAINTEXT://kafka2:9092,PLAINTEXT://kafka3:9092"
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: "3"
+      SCHEMA_REGISTRY_HEAP_OPTS: "-Xms256m -Xmx256m"
+
+# ---------- Plumbing ----------
+networks:
+  knet:
+
+volumes:
+  kafka1-data:
+  kafka2-data:
+  kafka3-data:
